@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from PIL import Image
 from sam2.utils.misc import AsyncVideoFrameLoader
+from collections import deque
 
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
@@ -64,6 +65,7 @@ def show_box(box, ax):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--video_dir', type=str, required=True, help='Directory with JPEG frames named as integers (e.g. 00000.jpg)')
+    p.add_argument('--end_frame', type=int, default=None, help='Optionally only process up to this frame index (exclusive)')
     p.add_argument('--checkpoint', type=str, required=True, help='Path to sam2 checkpoint (.pt)')
     p.add_argument('--config', type=str, required=True, help='Path to sam2 config (.yaml)')
     p.add_argument('--device', type=str, default=None, help='device: cuda, cpu, or leave empty to auto-detect')
@@ -559,7 +561,7 @@ def main():
     else:
         print(f'Propagating in chunks of {args.chunk_size} with {args.overlap} frame overlap...')
         total = len(frame_names)
-        prev_last_masks = None  # dict[obj_id] -> np.bool_(H,W)
+        prev_overlap_masks = None  # list[dict[obj_id -> mask]] for last `overlap` frames of previous chunk
         start = 0
         while start < total:
             # compute chunk range; add overlap on the left except for the first chunk
@@ -579,18 +581,23 @@ def main():
                 chunk_state = build_inference_state_from_paths(
                     predictor, chunk_paths, offload_video_to_cpu=args.offload_video_to_cpu
                 )
-                # seed with last masks at the overlapped first frame (index 0)
-                if prev_last_masks is not None and prepend > 0:
-                    for oid, m in prev_last_masks.items():
-                        try:
-                            predictor.add_new_mask(
-                                inference_state=chunk_state,
-                                frame_idx=0,
-                                obj_id=oid,
-                                mask=m.astype(np.uint8),
-                            )
-                        except Exception as e:
-                            print(f'Warning: add_new_mask failed for obj {oid} on new chunk start: {e}')
+                # seed with masks for the overlapped first `prepend` frames (indices 0..prepend-1)
+                if prev_overlap_masks is not None and prepend > 0:
+                    try:
+                        seed_frames = prev_overlap_masks[-prepend:]
+                    except Exception:
+                        seed_frames = []
+                    for f_idx, frame_masks in enumerate(seed_frames):
+                        for oid, m in frame_masks.items():
+                            try:
+                                predictor.add_new_mask(
+                                    inference_state=chunk_state,
+                                    frame_idx=f_idx,
+                                    obj_id=oid,
+                                    mask=m.astype(np.uint8),
+                                )
+                            except Exception as e:
+                                print(f'Warning: add_new_mask failed for obj {oid} on new chunk frame {f_idx}: {e}')
 
             # determine propagation range within this chunk (skip overlapped frame if any)
             if start == 0:
@@ -599,13 +606,17 @@ def main():
                 local_start_idx = prepend  # e.g., 1 when overlap=1
             max_frames = len(chunk_paths) - local_start_idx
 
+            # per-chunk buffer to keep only the last `args.overlap` frames' masks
+            overlap_buffer = deque(maxlen=args.overlap)
+
             for out_frame_idx_local, obj_ids_prop, video_res_masks in predictor.propagate_in_video(
                 chunk_state, start_frame_idx=local_start_idx, max_frame_num_to_track=max_frames
             ):
                 # map local index to global frame index
                 global_idx = chunk_start + out_frame_idx_local
-                if global_idx % args.frame_stride != 0:
-                    continue
+                stride_ok = (global_idx % args.frame_stride == 0)
+                # collect masks for this frame (for both output saving and overlap seeding)
+                frame_masks_dict = {}
                 for i, oid in enumerate(obj_ids_prop):
                     arr = (video_res_masks[i] > 0).squeeze().detach().cpu().numpy()
                     if arr.ndim > 2:
@@ -614,39 +625,39 @@ def main():
                         arr = arr.reshape(arr.shape[-2], arr.shape[-1])
                     mask_bool = arr > 0
                     ys, xs = np.where(mask_bool)
-                    if ys.size == 0:
-                        continue
-                    y0, y1 = int(ys.min()), int(ys.max())
-                    x0, x1 = int(xs.min()), int(xs.max())
-                    delta = 10
-                    x0 = max(0, x0 - delta)
-                    y0 = max(0, y0 - delta)
-                    x1 = min(arr.shape[1]-1, x1 + delta)
-                    y1 = min(arr.shape[0]-1, y1 + delta)
-                    bboxs_allframes.append((global_idx, oid, (x0, y0, x1, y1)))
+                    if ys.size != 0 and stride_ok:
+                        y0, y1 = int(ys.min()), int(ys.max())
+                        x0, x1 = int(xs.min()), int(xs.max())
+                        delta = 10
+                        x0 = max(0, x0 - delta)
+                        y0 = max(0, y0 - delta)
+                        x1 = min(arr.shape[1]-1, x1 + delta)
+                        y1 = min(arr.shape[0]-1, y1 + delta)
+                        bboxs_allframes.append((global_idx, oid, (x0, y0, x1, y1)))
                     # save visualization for this frame 调用overlay_and_save
-                    masks_dict = {
-                        oid: (video_res_masks[i] > 0).squeeze().detach().cpu().numpy().astype(np.uint8)
-                    }
+                    mask_np = (video_res_masks[i] > 0).squeeze().detach().cpu().numpy().astype(np.uint8)
+                    frame_masks_dict[oid] = mask_np
+                # append to overlap buffer (keeps only last `args.overlap` frames)
+                overlap_buffer.append(frame_masks_dict)
+                # optionally save visualization for this frame
+                if stride_ok and len(frame_masks_dict) > 0 and out_frame_idx_local - args.overlap == 0:
                     out_viz_path = os.path.join(args.output_dir, f'frame_{global_idx:05d}.png')
                     overlay_and_save(
                         os.path.join(video_dir, frame_names[global_idx]),
-                        masks_dict,
+                        frame_masks_dict,
                         out_viz_path
                     )
-                # keep last-frame masks for seeding next chunk
-                if out_frame_idx_local == len(chunk_paths) - 1:
-                    prev_last_masks = {
-                        oid: (video_res_masks[i] > 0).squeeze().detach().cpu().numpy().astype(np.uint8)
-                        for i, oid in enumerate(obj_ids_prop)
-                    }
+                if global_idx == args.end_frame:
+                    break
+            # keep last `args.overlap` frames' masks for seeding next chunk
+            prev_overlap_masks = list(overlap_buffer)
                 
                 
             # advance to next chunk start
             start += args.chunk_size
 
     # save all bboxs to an npz file
-    bboxs_outpath = os.path.join(args.output_dir, 'bboxes_allframes.npz')
+    bboxs_outpath = os.path.join(args.output_dir, 'bboxes_0-{}.npz'.format(args.end_frame if args.end_frame is not None else total))
     # convert to structured array for saving
     dtype = np.dtype([('frame_idx', np.int32), ('obj_id', np.int32), ('bbox', np.int32, (4,))])
     bboxs_array = np.array(bboxs_allframes, dtype=dtype)
